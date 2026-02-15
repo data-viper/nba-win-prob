@@ -3,9 +3,10 @@ import time
 import random
 import requests
 import pandas as pd
-from datetime import date, timedelta
 
-BASE_V1 = "https://api.balldontlie.io/nba/v1"
+# balldontlie v1 endpoint for games (cursor pagination)
+GAMES_URL = "https://api.balldontlie.io/v1/games"
+
 
 def api_key() -> str:
     key = os.getenv("BALLDONTLIE_API_KEY")
@@ -13,95 +14,146 @@ def api_key() -> str:
         raise RuntimeError("BALLDONTLIE_API_KEY is not set.")
     return key
 
-def get_with_retry(url: str, headers: dict, params: dict, timeout: int = 30, max_retries: int = 8):
+
+def get_with_retry(
+    url: str,
+    headers: dict,
+    params: dict,
+    timeout: int = 30,
+    max_retries: int = 10,
+):
     """
-    Handles rate limits (429) with exponential backoff + jitter.
+    GET with retry/backoff for rate limits (429) and transient errors.
     """
     delay = 2.0
     for attempt in range(1, max_retries + 1):
-        r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        try:
+            r = requests.get(url, headers=headers, params=params, timeout=timeout)
+        except requests.RequestException as e:
+            # transient network error
+            wait_s = min(delay + random.uniform(0, 1.0), 60)
+            print(f"[network] {e}. Waiting {wait_s:.1f}s (attempt {attempt}/{max_retries})...")
+            time.sleep(wait_s)
+            delay = min(delay * 2, 60)
+            continue
 
-        if r.status_code != 429:
-            r.raise_for_status()
-            return r
+        # Rate limit
+        if r.status_code == 429:
+            retry_after = r.headers.get("Retry-After")
+            wait_s = float(retry_after) if retry_after else min(delay + random.uniform(0, 1.0), 60)
+            print(f"[429] Rate limited. Waiting {wait_s:.1f}s (attempt {attempt}/{max_retries})...")
+            time.sleep(wait_s)
+            delay = min(delay * 2, 60)
+            continue
 
-        # If rate-limited, wait and retry
-        retry_after = r.headers.get("Retry-After")
-        if retry_after:
-            wait_s = float(retry_after)
-        else:
-            wait_s = delay + random.uniform(0, 1.0)
+        # Other HTTP errors
+        if r.status_code >= 400:
+            # Surface useful details
+            try:
+                msg = r.json()
+            except Exception:
+                msg = r.text[:500]
+            raise RuntimeError(f"HTTP {r.status_code} error for {r.url}\nResponse: {msg}")
 
-        print(f"[429] Rate limited. Waiting {wait_s:.1f}s (attempt {attempt}/{max_retries})...")
-        time.sleep(wait_s)
-        delay = min(delay * 2, 60)  # cap wait
+        return r
 
-    raise RuntimeError("Hit rate limit too many times. Try again later or reduce date range.")
+    raise RuntimeError("Too many retries. Try again later or slow the request pace.")
 
-def fetch_games_for_date(d: str) -> list[dict]:
+
+def fetch_games_for_season(season: int, sleep_s: float = 0.25) -> list[dict]:
+    """
+    Fetch all games for a season using cursor-based pagination.
+    """
     headers = {"Authorization": api_key()}
-    url = f"{BASE_V1}/games"
-    params = {"dates[]": d, "per_page": 100}
+    params = {"seasons[]": season, "per_page": 100}
 
-    rows = []
-    page = 1
+    rows: list[dict] = []
+    cursor = None
+    page_count = 0
+
     while True:
-        params["page"] = page
-        r = get_with_retry(url, headers, params)
+        if cursor is not None:
+            params["cursor"] = cursor
+        else:
+            params.pop("cursor", None)
+
+        r = get_with_retry(GAMES_URL, headers, params)
         payload = r.json()
-        rows.extend(payload.get("data", []))
 
-        meta = payload.get("meta", {})
-        next_page = meta.get("next_page")
-        if not next_page:
+        batch = payload.get("data", [])
+        rows.extend(batch)
+
+        meta = payload.get("meta", {}) or {}
+        cursor = meta.get("next_cursor")
+
+        page_count += 1
+        print(f"  season {season} | page {page_count} | fetched {len(batch)} | total {len(rows)}")
+
+        if not cursor:
             break
-        page = next_page
 
-        # be gentle; free tier is ~5 req/min
-        time.sleep(1.0)
+        time.sleep(sleep_s)
 
-    # also pause between dates
-    time.sleep(1.0)
     return rows
 
-def main():
-    # Start small to avoid rate limit
-    days_back = int(os.getenv("DAYS_BACK", "14"))
-    end = date.today()
-    start = end - timedelta(days=days_back)
 
-    all_rows = []
-    cur = start
-    while cur <= end:
-        print(f"Fetching games for {cur.isoformat()} ...")
-        all_rows.extend(fetch_games_for_date(cur.isoformat()))
-        cur += timedelta(days=1)
+def main():
+    seasons_str = os.getenv("SEASONS", "").strip()
+    if not seasons_str:
+        raise RuntimeError('Set SEASONS, e.g. $env:SEASONS="2023,2024"')
+
+    seasons = [int(s.strip()) for s in seasons_str.split(",") if s.strip()]
+
+    all_rows: list[dict] = []
+    for s in seasons:
+        print(f"Fetching season {s} ...")
+        all_rows.extend(fetch_games_for_season(s))
 
     if not all_rows:
-        print("No games returned from API.")
+        print("No games returned.")
         return
 
     df = pd.json_normalize(all_rows)
     df["date"] = pd.to_datetime(df["date"], utc=True)
 
-    df_out = df[[
-        "id", "date", "season", "status",
-        "home_team.id", "home_team.full_name", "home_team.abbreviation",
-        "visitor_team.id", "visitor_team.full_name", "visitor_team.abbreviation",
-        "home_team_score", "visitor_team_score"
-    ]].copy()
+    # Select/rename the columns we care about
+    df_out = df[
+        [
+            "id",
+            "date",
+            "season",
+            "status",
+            "home_team.id",
+            "home_team.full_name",
+            "home_team.abbreviation",
+            "visitor_team.id",
+            "visitor_team.full_name",
+            "visitor_team.abbreviation",
+            "home_team_score",
+            "visitor_team_score",
+        ]
+    ].copy()
 
     df_out.columns = [
-        "game_id", "game_date_utc", "season", "status",
-        "home_team_id", "home_team_name", "home_team_abbr",
-        "away_team_id", "away_team_name", "away_team_abbr",
-        "home_score", "away_score"
+        "game_id",
+        "game_date_utc",
+        "season",
+        "status",
+        "home_team_id",
+        "home_team_name",
+        "home_team_abbr",
+        "away_team_id",
+        "away_team_name",
+        "away_team_abbr",
+        "home_score",
+        "away_score",
     ]
 
     os.makedirs("data", exist_ok=True)
-    out_path = "data/games_recent.parquet"
+    out_path = f"data/games_seasons_{'_'.join(map(str, seasons))}.parquet"
     df_out.to_parquet(out_path, index=False)
-    print(f"Saved {len(df_out):,} rows to {out_path}")
+    print(f"\nSaved {len(df_out):,} rows to {out_path}")
+
 
 if __name__ == "__main__":
     main()
